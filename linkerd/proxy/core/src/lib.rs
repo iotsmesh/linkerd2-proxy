@@ -3,7 +3,4 @@
 mod accept;
 pub mod resolve;
 
-pub use self::{
-    accept::Accept,
-    resolve::{Resolution, Resolve},
-};
+pub use self::{accept::Accept, resolve::Resolve, resolve::Update};
