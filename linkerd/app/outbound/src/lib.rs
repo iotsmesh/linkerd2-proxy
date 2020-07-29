@@ -54,7 +54,6 @@ const EWMA_DECAY: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct Config {
     pub proxy: ProxyConfig,
-    pub canonicalize_timeout: Duration,
 }
 
 impl Config {
@@ -239,8 +238,7 @@ impl Config {
                 http::Request<http::boxed::Payload>,
                 Response = http::Response<http::boxed::Payload>,
                 Error = Error,
-            > + Clone
-            + Send
+            > + Send
             + 'static,
         S::Future: Send,
         R: Resolve<Concrete<http::Settings>, Endpoint = proxy::api_resolve::Metadata>
@@ -425,17 +423,15 @@ impl Config {
                     .push(http::strip_header::request::layer(L5D_CLIENT_ID))
                     .push(http::strip_header::request::layer(DST_OVERRIDE_HEADER)),
             )
-            // Sets the canonical-dst header on all outbound requests.
-            .check_service::<Logical<HttpEndpoint>>()
+            .check_make_service_clone::<Logical<HttpEndpoint>, http::Request<B>>()
             .instrument(|logical: &Logical<_>| info_span!("logical", addr = %logical.addr))
             .into_inner()
     }
 
-    pub async fn build_server<C, R, H, S>(
+    pub async fn build_server<C, H, S>(
         self,
         listen_addr: std::net::SocketAddr,
         listen: impl Stream<Item = std::io::Result<listen::Connection>> + Send + 'static,
-        refine: R,
         tcp_connect: C,
         http_router: H,
         metrics: ProxyMetrics,
@@ -443,12 +439,6 @@ impl Config {
         drain: drain::Watch,
     ) -> Result<(), Error>
     where
-        R: tower::Service<dns::Name, Error = Error, Response = dns::Name>
-            + Unpin
-            + Clone
-            + Send
-            + 'static,
-        R::Future: Unpin + Send,
         C: tower::Service<TcpEndpoint, Error = Error> + Unpin + Clone + Send + Sync + 'static,
         C::Response: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         C::Future: Unpin + Send,
@@ -463,12 +453,10 @@ impl Config {
                 Response = http::Response<http::boxed::Payload>,
                 Error = Error,
             > + Send
-            + Clone
             + 'static,
         S::Future: Send,
     {
         let Config {
-            canonicalize_timeout,
             proxy:
                 ProxyConfig {
                     server: ServerConfig { h2_settings, .. },
@@ -498,9 +486,6 @@ impl Config {
             .push(metrics.clone().http_handle_time.layer());
 
         let http_server = svc::stack(http_router)
-            // Resolve the application-emitted destination via DNS to determine
-            // its canonical FQDN to use for routing.
-            .push(http::canonicalize::Layer::new(refine, canonicalize_timeout))
             .check_make_service::<Logical<HttpEndpoint>, http::Request<_>>()
             .push_make_ready()
             .push_timeout(dispatch_timeout)
