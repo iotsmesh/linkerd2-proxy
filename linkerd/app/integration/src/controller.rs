@@ -276,13 +276,16 @@ impl pb::destination_server::Destination for Controller {
         req: grpc::Request<pb::GetDestination>,
     ) -> Result<grpc::Response<Self::GetProfileStream>, grpc::Status> {
         if let Ok(mut calls) = self.expect_profile_calls.lock() {
-            if let Some((dst, profile)) = calls.pop_front() {
-                if &dst == req.get_ref() {
-                    return Ok(grpc::Response::new(Box::pin(profile.map(Ok))));
-                }
+            match calls.pop_front() {
+                Some((dst, profile)) => {
+                    if &dst == req.get_ref() {
+                        return Ok(grpc::Response::new(Box::pin(profile.map(Ok))));
+                    }
 
-                calls.push_front((dst, profile));
-                return Err(grpc_unexpected_request());
+                    calls.push_front((dst, profile));
+                    return Err(grpc_unexpected_request());
+                }
+                None => return Ok(grpc::Response::new(Box::pin(futures::stream::empty()))),
             }
         }
 
