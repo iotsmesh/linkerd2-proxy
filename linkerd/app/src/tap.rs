@@ -58,15 +58,9 @@ impl Config {
                     service_fn(move |meta: tls::accept::Meta| {
                         let service = service.clone();
                         future::ok::<_, Never>(service_fn(move |io: io::BoxedIo| {
-                            let meta = meta.clone();
-                            let service = service.clone();
+                            let fut = service.clone().oneshot((meta.clone(), io));
                             Box::pin(async move {
-                                service
-                                    .oneshot((meta, io))
-                                    .err_into::<Error>()
-                                    .await?
-                                    .err_into::<Error>()
-                                    .await
+                                fut.err_into::<Error>().await?.err_into::<Error>().await
                             })
                         }))
                     }),
