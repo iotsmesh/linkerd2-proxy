@@ -1,14 +1,16 @@
+use futures::{future, prelude::*};
 use indexmap::IndexSet;
 use linkerd2_app_core::{
     config::ServerConfig,
     drain,
-    proxy::{detect, identity, tap},
+    proxy::{identity, tap},
     serve,
-    transport::tls,
-    Error,
+    transport::{io, tls},
+    Error, Never,
 };
 use std::net::SocketAddr;
 use std::pin::Pin;
+use tower::util::{service_fn, ServiceExt};
 
 #[derive(Clone, Debug)]
 pub enum Config {
@@ -49,9 +51,25 @@ impl Config {
             } => {
                 let (listen_addr, listen) = config.bind.bind()?;
 
-                let accept = detect::Accept::new(
-                    tls::DetectTls::new(identity, Default::default()),
-                    tap::AcceptPermittedClients::new(permitted_peer_identities.into(), server),
+                let service =
+                    tap::AcceptPermittedClients::new(permitted_peer_identities.into(), server);
+                let accept = tls::DetectTls::new(
+                    identity,
+                    service_fn(move |meta: tls::accept::Meta| {
+                        let service = service.clone();
+                        future::ok::<_, Never>(service_fn(move |io: io::BoxedIo| {
+                            let meta = meta.clone();
+                            let service = service.clone();
+                            Box::pin(async move {
+                                service
+                                    .oneshot((meta, io))
+                                    .err_into::<Error>()
+                                    .await?
+                                    .err_into::<Error>()
+                                    .await
+                            })
+                        }))
+                    }),
                 );
 
                 let serve = Box::pin(serve::serve(listen, accept, drain.signal()));

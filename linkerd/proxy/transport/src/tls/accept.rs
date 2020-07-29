@@ -2,14 +2,21 @@ use super::{conditional_accept, Conditional, PeerIdentity, ReasonForNoPeerName};
 use crate::io::{BoxedIo, PrefixedIo};
 use crate::listen::Addrs;
 use bytes::BytesMut;
+use futures::prelude::*;
 use linkerd2_dns_name as dns;
+use linkerd2_error::{Error, Never};
 use linkerd2_identity as identity;
 pub use rustls::ServerConfig as Config;
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::{
     io::{self, AsyncReadExt},
     net::TcpStream,
 };
+use tower::util::ServiceExt;
 use tracing::{debug, trace, warn};
 
 pub trait HasConfig {
@@ -33,9 +40,16 @@ pub struct Meta {
 pub type Connection = (Meta, BoxedIo);
 
 #[derive(Clone, Debug)]
-pub struct AcceptTls<I, A> {
+pub struct DetectTls<I, A> {
     local_identity: Conditional<I>,
-    make_accept: A,
+    inner: A,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptTls<I, A> {
+    addrs: Addrs,
+    local_identity: Conditional<I>,
+    inner: A,
 }
 
 // The initial peek buffer is statically allocated on the stack and is fairly small; but it is
@@ -46,38 +60,94 @@ const PEEK_CAPACITY: usize = 512;
 // insufficient. This is the same value used in HTTP detection.
 const BUFFER_CAPACITY: usize = 8192;
 
-impl<I: HasConfig, M> AcceptTls<I, M> {
-    pub fn new(local_identity: Conditional<I>, make_accept: M) -> Self {
+impl<I: HasConfig, M> DetectTls<I, M> {
+    pub fn new(local_identity: Conditional<I>, inner: M) -> Self {
         Self {
             local_identity,
-            make_accept,
+            inner,
         }
     }
 }
 
-// impl<I: HasConfig, M> tower::Service<TcpStream> for AcceptTls<I, M>
-// where
-//     M: tower::Service,
-// {
-//     type Response = ();
-//     type Error = M::Error;
-//     type Future = Pin<Box<dyn Future<Output = Result<(), A::Error>> + Send + 'static>>;
+impl<I: HasConfig, M> tower::Service<Addrs> for DetectTls<I, M>
+where
+    I: Clone,
+    M: tower::Service<Meta> + Clone,
+{
+    type Response = AcceptTls<I, M>;
+    type Error = Never;
+    type Future = future::Ready<Result<AcceptTls<I, M>, Never>>;
 
-//     fn call(&self, tcp: TcpStream) -> Self::Future {
-//         match self.local_identity.as_ref() {
-//             Conditional::Some(local) => {
-//                 let config = local.tls_server_config();
-//                 let name = local.tls_server_name();
-//                 Box::pin(async move {
-//                     detect(config, name, tcp).await;
-//                 })
-//             }
-//             Conditional::None(reason) => {
-//                 Box::pin(future::ok((Conditional::None(reason), BoxedIo::new(tcp))))
-//             }
-//         }
-//     }
-// }
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // The `accept` is cloned into the response future, so its readiness isn't important.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, addrs: Addrs) -> Self::Future {
+        future::ok(AcceptTls {
+            addrs,
+            local_identity: self.local_identity.clone(),
+            inner: self.inner.clone(),
+        })
+    }
+}
+
+impl<I: HasConfig, M, A> tower::Service<TcpStream> for AcceptTls<I, M>
+where
+    M: tower::Service<Meta, Response = A> + Clone + Send + 'static,
+    M::Error: Into<Error>,
+    M::Future: Send,
+    A: tower::Service<BoxedIo, Response = ()> + Send,
+    A::Error: Into<Error>,
+    A::Future: Send,
+{
+    type Response = ();
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, tcp: TcpStream) -> Self::Future {
+        let addrs = self.addrs.clone();
+        let make = self.inner.clone();
+
+        match self.local_identity.as_ref() {
+            Conditional::Some(local) => {
+                let config = local.tls_server_config();
+                let name = local.tls_server_name();
+
+                Box::pin(async move {
+                    let (peer_identity, io) = detect(config, name, tcp).err_into::<Error>().await?;
+                    let meta = Meta {
+                        peer_identity,
+                        addrs,
+                    };
+                    make.oneshot(meta)
+                        .err_into::<Error>()
+                        .await?
+                        .oneshot(io)
+                        .err_into::<Error>()
+                        .await
+                })
+            }
+
+            Conditional::None(reason) => Box::pin(async move {
+                let meta = Meta {
+                    peer_identity: Conditional::None(reason),
+                    addrs,
+                };
+                make.oneshot(meta)
+                    .err_into::<Error>()
+                    .await?
+                    .oneshot(BoxedIo::new(tcp))
+                    .err_into::<Error>()
+                    .await
+            }),
+        }
+    }
+}
 
 pub async fn detect(
     tls_config: Arc<Config>,

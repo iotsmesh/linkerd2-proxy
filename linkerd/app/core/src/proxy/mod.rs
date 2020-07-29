@@ -16,5 +16,5 @@ pub use linkerd2_proxy_tcp as tcp;
 mod server;
 mod skip_detect;
 
-pub use self::server::AcceptHttp;
+pub use self::server::DetectHttp;
 pub use self::skip_detect::SkipDetect;

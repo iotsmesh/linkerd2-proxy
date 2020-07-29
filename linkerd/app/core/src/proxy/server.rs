@@ -27,7 +27,7 @@ type Server = hyper::server::conn::Http<trace::Executor>;
 pub struct DetectTimeout(());
 
 #[derive(Clone, Debug)]
-pub struct AcceptHttp<F, H> {
+pub struct DetectHttp<F, H> {
     tcp: F,
     http: H,
     timeout: Duration,
@@ -44,7 +44,7 @@ pub struct AcceptHttp<F, H> {
 /// Otherwise, the `F` type forwarding service is used to handle the TCP
 /// connection.
 #[derive(Clone, Debug)]
-pub struct ServeHttp<F, H> {
+pub struct AcceptHttp<F, H> {
     tcp: F,
     http: H,
     timeout: Duration,
@@ -52,10 +52,10 @@ pub struct ServeHttp<F, H> {
     drain: drain::Watch,
 }
 
-// === impl AcceptHttp ===
+// === impl DetectHttp ===
 
-impl<F, H> AcceptHttp<F, H> {
-    /// Creates a new `ServeHttp`.
+impl<F, H> DetectHttp<F, H> {
+    /// Creates a new `AcceptHttp`.
     pub fn new(h2: H2Settings, timeout: Duration, http: H, tcp: F, drain: drain::Watch) -> Self {
         let mut server = hyper::server::conn::Http::new().with_executor(trace::Executor::new());
         server
@@ -72,7 +72,7 @@ impl<F, H> AcceptHttp<F, H> {
     }
 }
 
-impl<T, F, S> Service<T> for AcceptHttp<F, S>
+impl<T, F, S> Service<T> for DetectHttp<F, S>
 where
     T: Clone + Send + 'static,
     F: tower::Service<T> + Clone + Send + 'static,
@@ -84,7 +84,7 @@ where
     S::Response: Send + 'static,
     S::Future: Send + 'static,
 {
-    type Response = ServeHttp<F::Response, S::Response>;
+    type Response = AcceptHttp<F::Response, S::Response>;
     type Error = Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -106,7 +106,7 @@ where
                 http.oneshot(target).map_err(Into::<Error>::into)
             )?;
 
-            Ok(ServeHttp {
+            Ok(AcceptHttp {
                 timeout,
                 server,
                 http,
@@ -117,10 +117,10 @@ where
     }
 }
 
-// === impl ServeHttp ===
+// === impl AcceptHttp ===
 
-impl<F, H> ServeHttp<F, H> {
-    /// Creates a new `ServeHttp`.
+impl<F, H> AcceptHttp<F, H> {
+    /// Creates a new `AcceptHttp`.
     pub fn new(server: Server, timeout: Duration, http: H, tcp: F, drain: drain::Watch) -> Self {
         Self {
             server,
@@ -132,7 +132,7 @@ impl<F, H> ServeHttp<F, H> {
     }
 }
 
-impl<I, F, S> Service<I> for ServeHttp<F, S>
+impl<I, F, S> Service<I> for AcceptHttp<F, S>
 where
     I: io::AsyncRead + io::AsyncWrite + Send + Unpin + 'static,
     F: tower::Service<PrefixedIo<I>, Response = ()> + Clone + Send + 'static,

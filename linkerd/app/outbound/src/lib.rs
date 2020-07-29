@@ -19,7 +19,7 @@ use linkerd2_app_core::{
     profiles,
     proxy::{
         self, core::resolve::Resolve, discover, http, identity, resolve::map_endpoint, tap, tcp,
-        AcceptHttp, SkipDetect,
+        DetectHttp, SkipDetect,
     },
     reconnect, retry, router, serve,
     spans::SpanConverter,
@@ -536,23 +536,21 @@ impl Config {
             .check_service::<listen::Addrs>()
             .into_inner();
 
-        let http = AcceptHttp::new(
+        let http = DetectHttp::new(
             h2_settings,
             detect_protocol_timeout,
             http_server,
             tcp_forward.clone(),
             drain.clone(),
         );
-        let tcp_accept = svc::stack(SkipDetect::new(
-            disable_protocol_detection_for_ports,
-            http,
-            tcp_forward,
-        ))
-        .check_service::<listen::Addrs>()
-        .push(metrics.transport.layer_accept(TransportLabels));
+        let detect = SkipDetect::new(disable_protocol_detection_for_ports, http, tcp_forward);
+        let accept = svc::stack(detect)
+            .check_service::<listen::Addrs>()
+            .push(metrics.transport.layer_accept(TransportLabels))
+            .into_inner();
 
         info!(addr = %listen_addr, "Serving");
-        serve::serve(listen, tcp_accept.into_inner(), drain.signal()).await
+        serve::serve(listen, accept, drain.signal()).await
     }
 }
 
