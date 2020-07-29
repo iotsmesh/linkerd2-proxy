@@ -22,7 +22,7 @@ use linkerd2_app_core::{
     reconnect, router, serve,
     spans::SpanConverter,
     svc::{self, NewService},
-    transport::{self, io::BoxedIo, listen, tls},
+    transport::{self, io::BoxedIo, tls},
     Error, ProxyMetrics, TraceContextLayer, DST_OVERRIDE_HEADER, L5D_CLIENT_ID, L5D_REMOTE_IP,
     L5D_SERVER_ID,
 };
@@ -316,18 +316,15 @@ impl Config {
             + 'static,
         S::Future: Send,
     {
-        let Config {
-            proxy:
-                ProxyConfig {
-                    server: ServerConfig { h2_settings, .. },
-                    disable_protocol_detection_for_ports,
-                    dispatch_timeout,
-                    max_in_flight_requests,
-                    detect_protocol_timeout,
-                    buffer_capacity,
-                    ..
-                },
-        } = self;
+        let ProxyConfig {
+            server: ServerConfig { h2_settings, .. },
+            disable_protocol_detection_for_ports,
+            dispatch_timeout,
+            max_in_flight_requests,
+            detect_protocol_timeout,
+            buffer_capacity,
+            ..
+        } = self.proxy;
 
         // Strips headers that may be set by the inbound router.
         let http_strip_headers = svc::layers()
@@ -401,7 +398,7 @@ impl Config {
             .push(svc::layer::mk(tcp::Forward::new));
 
         let detect_forward = svc::stack(tcp_forward.clone())
-            .push_map_target(|meta: tls::accept::Meta| TcpEndpoint::from(meta.addrs.target_addr()))
+            .push_map_target(TcpEndpoint::from)
             .into_inner();
         let http = DetectHttp::new(
             h2_settings,
@@ -417,7 +414,7 @@ impl Config {
             }));
 
         let accept_forward = svc::stack(tcp_forward)
-            .push_map_target(|addrs: listen::Addrs| TcpEndpoint::from(addrs.target_addr()))
+            .push_map_target(TcpEndpoint::from)
             .into_inner();
         let accept = SkipDetect::new(disable_protocol_detection_for_ports, tls, accept_forward);
 

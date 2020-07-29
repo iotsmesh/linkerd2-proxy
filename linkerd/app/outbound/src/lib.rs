@@ -456,18 +456,15 @@ impl Config {
             + 'static,
         S::Future: Send,
     {
-        let Config {
-            proxy:
-                ProxyConfig {
-                    server: ServerConfig { h2_settings, .. },
-                    disable_protocol_detection_for_ports,
-                    dispatch_timeout,
-                    max_in_flight_requests,
-                    detect_protocol_timeout,
-                    buffer_capacity,
-                    ..
-                },
-        } = self;
+        let ProxyConfig {
+            server: ServerConfig { h2_settings, .. },
+            disable_protocol_detection_for_ports,
+            dispatch_timeout,
+            max_in_flight_requests,
+            detect_protocol_timeout,
+            buffer_capacity,
+            ..
+        } = self.proxy;
 
         let http_admit_request = svc::layers()
             // Limits the number of in-flight requests.
@@ -496,8 +493,8 @@ impl Config {
             .push_on_response(
                 svc::layers()
                     .push(http_admit_request)
+                    .push_spawn_buffer(buffer_capacity) // XXX FIXME TODO REMOVE ME
                     .push(metrics.stack.layer(stack_labels("source")))
-                    .push_spawn_buffer(buffer_capacity)
                     .box_http_request()
                     .box_http_response(),
             )
@@ -512,12 +509,11 @@ impl Config {
         // their constructor. This helps to ensure that tasks are spawned on the
         // same runtime as the proxy.
         // Forwards TCP streams that cannot be decoded as HTTP.
-        let tcp_forward = svc::stack(tcp_connect)
+        let tcp_forward = svc::stack(tcp::Forward::new(tcp_connect))
             .push(admit::AdmitLayer::new(PreventLoop::from(
                 listen_addr.port(),
             )))
-            .push_map_target(|addrs: listen::Addrs| TcpEndpoint::from(addrs.target_addr()))
-            .push(svc::layer::mk(tcp::Forward::new))
+            .push_map_target(TcpEndpoint::from)
             .check_service::<listen::Addrs>()
             .into_inner();
 
