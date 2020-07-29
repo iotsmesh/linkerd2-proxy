@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::prelude::*;
 use linkerd2_error::Error;
-use linkerd2_io::{AsyncRead, AsyncWrite, BoxedIo};
+use linkerd2_io::{AsyncRead, AsyncWrite};
 use linkerd2_proxy_core as core;
 use std::{
     future::Future,
@@ -17,7 +17,7 @@ pub trait Detect<T, I: AsyncRead + AsyncWrite> {
     type Io: AsyncRead + AsyncWrite + Send + Unpin;
     type Error: Into<Error>;
 
-    async fn detect(&self, target: T, io: I) -> Result<(Self::Target, Self::Io), Self::Error>;
+    async fn detect(&self, io: I) -> Result<(Self::Target, Self::Io), Self::Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +51,12 @@ impl<D: Clone, A> Accept<D, A> {
     }
 }
 
-impl<T, I, D, A> tower::Service<(T, I)> for Accept<D, A>
+impl<I, D, A> tower::Service<I> for Accept<D, A>
 where
-    T: Send + 'static,
     I: AsyncRead + AsyncWrite + Send + 'static,
-    D: Detect<T, I, Io = BoxedIo> + Clone + Send + 'static,
+    D: Detect<T, I> + Clone + Send + 'static,
     D::Target: Send,
-    A: core::Accept<(D::Target, BoxedIo)> + Send + Clone + 'static,
+    A: core::Accept<(D::Target, D::Io)> + Send + Clone + 'static,
     A::Future: Send,
 {
     type Response = A::ConnectionFuture;
@@ -69,7 +68,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, (target, io): (T, I)) -> Self::Future {
+    fn call(&mut self, io: I) -> Self::Future {
         let detect = self.detect.clone();
         let mut accept = self.accept.clone().into_service();
         Box::pin(async move {
@@ -77,7 +76,7 @@ where
             // aborted.
             let (accept, conn) = futures::try_join!(
                 accept.ready_and().map_err(Into::into),
-                detect.detect(target, io).map_err(Into::into)
+                detect.detect(io).map_err(Into::into)
             )?;
 
             accept.call(conn).await.map_err(Into::into)

@@ -27,11 +27,11 @@ pub use linkerd2_stack_metrics as stack_metrics;
 pub use linkerd2_stack_tracing as stack_tracing;
 pub use linkerd2_trace_context::TraceContextLayer;
 
-pub mod accept_error;
 pub mod admin;
 pub mod classify;
 pub mod config;
 pub mod control;
+pub mod detect;
 pub mod dns;
 pub mod dst;
 pub mod errors;

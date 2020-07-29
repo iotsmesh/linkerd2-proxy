@@ -2,10 +2,8 @@ use super::{conditional_accept, Conditional, PeerIdentity, ReasonForNoPeerName};
 use crate::io::{BoxedIo, PrefixedIo};
 use crate::listen::Addrs;
 use bytes::BytesMut;
-use indexmap::IndexSet;
 use linkerd2_dns_name as dns;
 use linkerd2_identity as identity;
-use linkerd2_proxy_detect as detect;
 pub use rustls::ServerConfig as Config;
 use std::sync::Arc;
 use tokio::{
@@ -35,9 +33,9 @@ pub struct Meta {
 pub type Connection = (Meta, BoxedIo);
 
 #[derive(Clone, Debug)]
-pub struct DetectTls<I> {
+pub struct AcceptTls<I, A> {
     local_identity: Conditional<I>,
-    skip_ports: Arc<IndexSet<u16>>,
+    make_accept: A,
 }
 
 // The initial peek buffer is statically allocated on the stack and is fairly small; but it is
@@ -48,55 +46,40 @@ const PEEK_CAPACITY: usize = 512;
 // insufficient. This is the same value used in HTTP detection.
 const BUFFER_CAPACITY: usize = 8192;
 
-impl<I: HasConfig> DetectTls<I> {
-    pub fn new(local_identity: Conditional<I>, skip_ports: Arc<IndexSet<u16>>) -> Self {
+impl<I: HasConfig, M> AcceptTls<I, M> {
+    pub fn new(local_identity: Conditional<I>, make_accept: M) -> Self {
         Self {
             local_identity,
-            skip_ports,
+            make_accept,
         }
     }
 }
 
-#[async_trait::async_trait]
-impl<I: HasConfig + Send + Sync> detect::Detect<Addrs, TcpStream> for DetectTls<I> {
-    type Target = Meta;
-    type Io = BoxedIo;
-    type Error = io::Error;
+// impl<I: HasConfig, M> tower::Service<TcpStream> for AcceptTls<I, M>
+// where
+//     M: tower::Service,
+// {
+//     type Response = ();
+//     type Error = M::Error;
+//     type Future = Pin<Box<dyn Future<Output = Result<(), A::Error>> + Send + 'static>>;
 
-    async fn detect(&self, addrs: Addrs, tcp: TcpStream) -> io::Result<(Meta, BoxedIo)> {
-        let local = match self.local_identity.as_ref() {
-            Conditional::Some(l) => l,
-            Conditional::None(reason) => {
-                let meta = Meta {
-                    peer_identity: Conditional::None(reason),
-                    addrs,
-                };
-                return Ok((meta, BoxedIo::new(tcp)));
-            }
-        };
+//     fn call(&self, tcp: TcpStream) -> Self::Future {
+//         match self.local_identity.as_ref() {
+//             Conditional::Some(local) => {
+//                 let config = local.tls_server_config();
+//                 let name = local.tls_server_name();
+//                 Box::pin(async move {
+//                     detect(config, name, tcp).await;
+//                 })
+//             }
+//             Conditional::None(reason) => {
+//                 Box::pin(future::ok((Conditional::None(reason), BoxedIo::new(tcp))))
+//             }
+//         }
+//     }
+// }
 
-        let port = addrs.target_addr().port();
-        if self.skip_ports.contains(&port) {
-            debug!(%port, "Skipping TLS detection on port");
-            let meta = Meta {
-                peer_identity: Conditional::None(ReasonForNoPeerName::PortSkipped),
-                addrs,
-            };
-            return Ok((meta, BoxedIo::new(tcp)));
-        }
-
-        let (peer_identity, io) =
-            detect(local.tls_server_config(), local.tls_server_name(), tcp).await?;
-
-        let meta = Meta {
-            addrs,
-            peer_identity,
-        };
-        Ok((meta, io))
-    }
-}
-
-async fn detect(
+pub async fn detect(
     tls_config: Arc<Config>,
     local_id: identity::Name,
     mut tcp: TcpStream,

@@ -4,37 +4,35 @@ use crate::proxy::http::{
     h2::Settings as H2Settings,
     trace, upgrade, Version as HttpVersion,
 };
-use crate::transport::{
-    io::{self, BoxedIo},
-    tls,
-};
+use crate::transport::io::{self, PrefixedIo};
 use crate::{
     drain,
-    proxy::{core::Accept, detect},
-    svc::{NewService, Service, ServiceExt},
+    svc::{Service, ServiceExt},
     Error,
 };
-use async_trait::async_trait;
-use futures::TryFutureExt;
+use futures::prelude::*;
 use hyper;
-use indexmap::IndexSet;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tracing::{info_span, trace};
 use tracing_futures::Instrument;
 
-#[derive(Clone, Debug)]
-pub struct Protocol<T> {
-    pub http: Option<HttpVersion>,
-    pub target: T,
-}
+type Server = hyper::server::conn::Http<trace::Executor>;
+
+#[derive(Copy, Clone, Debug)]
+pub struct DetectTimeout(());
 
 #[derive(Clone, Debug)]
-pub struct DetectHttp {
-    capacity: usize,
-    skip_ports: Arc<IndexSet<u16>>,
+pub struct AcceptHttp<F, H> {
+    tcp: F,
+    http: H,
+    timeout: Duration,
+    server: Server,
+    drain: drain::Watch,
 }
 
 /// Accepts HTTP connections.
@@ -47,48 +45,75 @@ pub struct DetectHttp {
 /// connection.
 #[derive(Clone, Debug)]
 pub struct ServeHttp<F, H> {
-    http: hyper::server::conn::Http<trace::Executor>,
-    forward_tcp: F,
-    make_http: H,
+    tcp: F,
+    http: H,
+    timeout: Duration,
+    server: hyper::server::conn::Http<trace::Executor>,
     drain: drain::Watch,
 }
 
-// === impl DetectHttp ===
+// === impl AcceptHttp ===
 
-impl DetectHttp {
-    const PEEK_CAPACITY: usize = 8192;
+impl<F, H> AcceptHttp<F, H> {
+    /// Creates a new `ServeHttp`.
+    pub fn new(h2: H2Settings, timeout: Duration, http: H, tcp: F, drain: drain::Watch) -> Self {
+        let mut server = hyper::server::conn::Http::new().with_executor(trace::Executor::new());
+        server
+            .http2_initial_stream_window_size(h2.initial_stream_window_size)
+            .http2_initial_connection_window_size(h2.initial_connection_window_size);
 
-    pub fn new(skip_ports: Arc<IndexSet<u16>>) -> Self {
-        DetectHttp {
-            skip_ports,
-            capacity: Self::PEEK_CAPACITY,
+        Self {
+            timeout,
+            server,
+            tcp,
+            http,
+            drain,
         }
     }
 }
 
-#[async_trait]
-impl detect::Detect<tls::accept::Meta, BoxedIo> for DetectHttp {
-    type Target = Protocol<tls::accept::Meta>;
-    type Io = BoxedIo;
-    type Error = io::Error;
+impl<T, F, S> Service<T> for AcceptHttp<F, S>
+where
+    T: Clone + Send + 'static,
+    F: tower::Service<T> + Clone + Send + 'static,
+    F::Error: Into<Error>,
+    F::Response: Send + 'static,
+    F::Future: Send + 'static,
+    S: Service<T> + Clone + Unpin + Send + 'static,
+    S::Error: Into<Error>,
+    S::Response: Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = ServeHttp<F::Response, S::Response>;
+    type Error = Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
-    async fn detect(
-        &self,
-        target: tls::accept::Meta,
-        io: BoxedIo,
-    ) -> Result<(Self::Target, BoxedIo), Self::Error> {
-        let port = target.addrs.target_addr().port();
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
 
-        // Skip detection if the port is in the configured set.
-        if self.skip_ports.contains(&port) {
-            let proto = Protocol { target, http: None };
-            return Ok::<_, Self::Error>((proto, io));
-        }
+    fn call(&mut self, target: T) -> Self::Future {
+        let drain = self.drain.clone();
+        let tcp = self.tcp.clone();
+        let http = self.http.clone();
+        let server = self.server.clone();
+        let timeout = self.timeout;
 
-        // Otherwise, attempt to peek the client connection to determine the protocol.
-        // Currently, we only check for an HTTP prefix.
-        let (http, io) = HttpVersion::detect(io).await?;
-        Ok((Protocol { target, http }, BoxedIo::new(io)))
+        Box::pin(async move {
+            let (tcp, http) = futures::try_join!(
+                tcp.oneshot(target.clone()).map_err(Into::<Error>::into),
+                http.oneshot(target).map_err(Into::<Error>::into)
+            )?;
+
+            Ok(ServeHttp {
+                timeout,
+                server,
+                http,
+                tcp,
+                drain,
+            })
+        })
     }
 }
 
@@ -96,35 +121,31 @@ impl detect::Detect<tls::accept::Meta, BoxedIo> for DetectHttp {
 
 impl<F, H> ServeHttp<F, H> {
     /// Creates a new `ServeHttp`.
-    pub fn new(make_http: H, h2: H2Settings, forward_tcp: F, drain: drain::Watch) -> Self {
-        let mut http = hyper::server::conn::Http::new().with_executor(trace::Executor::new());
-        http.http2_initial_stream_window_size(h2.initial_stream_window_size)
-            .http2_initial_connection_window_size(h2.initial_connection_window_size);
-
+    pub fn new(server: Server, timeout: Duration, http: H, tcp: F, drain: drain::Watch) -> Self {
         Self {
+            server,
+            timeout,
+            tcp,
             http,
-            forward_tcp,
-            make_http,
             drain,
         }
     }
 }
 
-impl<T, I, F, H, S> Service<(Protocol<T>, I)> for ServeHttp<F, H>
+impl<I, F, S> Service<I> for ServeHttp<F, S>
 where
-    T: Send + 'static,
     I: io::AsyncRead + io::AsyncWrite + Send + Unpin + 'static,
-    F: Accept<(T, I)> + Clone + Send + 'static,
+    F: tower::Service<PrefixedIo<I>, Response = ()> + Clone + Send + 'static,
+    F::Error: Into<Error>,
     F::Future: Send + 'static,
-    F::ConnectionFuture: Send + 'static,
-    H: NewService<T, Service = S> + Clone + Send + 'static,
     S: Service<http::Request<Body>, Response = http::Response<http::boxed::Payload>, Error = Error>
+        + Clone
         + Unpin
         + Send
         + 'static,
     S::Future: Send + 'static,
 {
-    type Response = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
+    type Response = ();
     type Error = Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -133,69 +154,66 @@ where
         Poll::Ready(Ok(().into()))
     }
 
-    fn call(&mut self, (protocol, io): (Protocol<T>, I)) -> Self::Future {
+    fn call(&mut self, io: I) -> Self::Future {
         let drain = self.drain.clone();
-        let forward_tcp = self.forward_tcp.clone();
-        let make_http = self.make_http.clone();
-        let mut http = self.http.clone();
+        let tcp = self.tcp.clone();
+        let http = self.http.clone();
+        let mut server = self.server.clone();
 
+        let timeout = tokio::time::delay_for(self.timeout);
         Box::pin(async move {
-            let rsp: Self::Response = match protocol.http {
+            let (version, io) = tokio::select! {
+                res = HttpVersion::detect(io) => { res? }
+                () = timeout => {
+                    return Err(DetectTimeout(()).into());
+                }
+            };
+
+            match version {
                 Some(HttpVersion::Http1) => {
                     trace!("Handling as HTTP");
                     // Enable support for HTTP upgrades (CONNECT and websockets).
-                    let svc = upgrade::Service::new(
-                        make_http.new_service(protocol.target),
-                        drain.clone(),
-                    );
-                    let conn = http
+                    let http = upgrade::Service::new(http, drain.clone());
+                    let conn = server
                         .http1_only(true)
-                        .serve_connection(io, HyperServerSvc::new(svc))
+                        .serve_connection(io, HyperServerSvc::new(http))
                         .with_upgrades();
 
-                    Box::pin(async move {
-                        drain
-                            .watch(conn, |conn| Pin::new(conn).graceful_shutdown())
-                            .instrument(info_span!("h1"))
-                            .await?;
-                        Ok(())
-                    })
+                    drain
+                        .watch(conn, |conn| Pin::new(conn).graceful_shutdown())
+                        .instrument(info_span!("h1"))
+                        .await?;
                 }
 
                 Some(HttpVersion::H2) => {
                     trace!("Handling as H2");
-                    let conn = http.http2_only(true).serve_connection(
-                        io,
-                        HyperServerSvc::new(make_http.new_service(protocol.target)),
-                    );
+                    let conn = server
+                        .http2_only(true)
+                        .serve_connection(io, HyperServerSvc::new(http));
 
-                    Box::pin(async move {
-                        drain
-                            .watch(conn, |conn| Pin::new(conn).graceful_shutdown())
-                            .instrument(info_span!("h2"))
-                            .await?;
-                        Ok(())
-                    })
+                    drain
+                        .watch(conn, |conn| Pin::new(conn).graceful_shutdown())
+                        .instrument(info_span!("h2"))
+                        .await?;
                 }
 
                 None => {
                     trace!("Forwarding TCP");
-                    let duplex = forward_tcp
-                        .into_service()
-                        .oneshot((protocol.target, io))
-                        .await
-                        .map_err(Into::into)?;
-
-                    Box::pin(
-                        drain
-                            .ignore_signal()
-                            .release_after(duplex)
-                            .map_err(Into::into),
-                    )
+                    let release = drain.ignore_signal();
+                    tcp.oneshot(io).err_into::<Error>().await?;
+                    drop(release);
                 }
-            };
+            }
 
-            Ok(rsp)
+            Ok(())
         })
     }
 }
+
+impl std::fmt::Display for DetectTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP detection timeout")
+    }
+}
+
+impl std::error::Error for DetectTimeout {}

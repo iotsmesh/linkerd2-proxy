@@ -2,7 +2,6 @@
 
 pub use linkerd2_proxy_api_resolve as api_resolve;
 pub use linkerd2_proxy_core as core;
-pub use linkerd2_proxy_detect as detect;
 pub use linkerd2_proxy_discover as discover;
 pub use linkerd2_proxy_http::{
     self as http,
@@ -14,6 +13,8 @@ pub use linkerd2_proxy_resolve as resolve;
 pub use linkerd2_proxy_tap as tap;
 pub use linkerd2_proxy_tcp as tcp;
 
-pub mod server;
+mod server;
+mod skip_detect;
 
-pub use self::server::ServeHttp;
+pub use self::server::AcceptHttp;
+pub use self::skip_detect::SkipDetect;
