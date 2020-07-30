@@ -77,6 +77,7 @@ impl Config {
     /// It is currently required that this be run on a Tokio runtime, since some
     /// services are created eagerly and must spawn tasks to do so.
     pub async fn build(self, log_level: trace::LevelHandle) -> Result<App, Error> {
+        debug!(app = ?self, "Building app");
         let Config {
             admin,
             dns,
@@ -88,7 +89,7 @@ impl Config {
             gateway,
             tap,
         } = self;
-        debug!("building app");
+
         let (metrics, report) = Metrics::new(admin.metrics_retain_idle);
 
         let dns = dns.build();
@@ -155,10 +156,10 @@ impl Config {
         let oc_span_sink = oc_collector.span_sink();
 
         let start_proxy = Box::pin(async move {
+            let refine = outbound.build_dns_refine(resolver, &outbound_metrics.stack);
+
             let outbound_connect =
                 outbound.build_tcp_connect(local_identity.clone(), &outbound_metrics);
-
-            let refine = outbound.build_dns_refine(resolver, &outbound_metrics.stack);
 
             let outbound_http_endpoint = outbound.build_http_endpoint(
                 outbound_addr.port(),

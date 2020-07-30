@@ -458,13 +458,14 @@ impl Config {
     {
         let ProxyConfig {
             server: ServerConfig { h2_settings, .. },
-            disable_protocol_detection_for_ports,
+            disable_protocol_detection_for_ports: skip_detect,
             dispatch_timeout,
             max_in_flight_requests,
             detect_protocol_timeout,
             buffer_capacity,
             ..
         } = self.proxy;
+        let prevent_loop = PreventLoop::from(listen_addr.port());
 
         let http_admit_request = svc::layers()
             // Limits the number of in-flight requests.
@@ -510,12 +511,8 @@ impl Config {
         // same runtime as the proxy.
         // Forwards TCP streams that cannot be decoded as HTTP.
         let tcp_forward = svc::stack(tcp::Forward::new(tcp_connect))
-            .push(admit::AdmitLayer::new(PreventLoop::from(
-                listen_addr.port(),
-            )))
-            .push_map_target(TcpEndpoint::from)
-            .check_service::<listen::Addrs>()
-            .into_inner();
+            .push(admit::AdmitLayer::new(prevent_loop))
+            .push_map_target(TcpEndpoint::from);
 
         let http = DetectHttp::new(
             h2_settings,
@@ -524,11 +521,9 @@ impl Config {
             tcp_forward.clone(),
             drain.clone(),
         );
-        let detect = SkipDetect::new(disable_protocol_detection_for_ports, http, tcp_forward);
-        let accept = svc::stack(detect)
-            .check_service::<listen::Addrs>()
-            .push(metrics.transport.layer_accept(TransportLabels))
-            .into_inner();
+
+        let accept = svc::stack(SkipDetect::new(skip_detect, http, tcp_forward))
+            .push(metrics.transport.layer_accept(TransportLabels));
 
         info!(addr = %listen_addr, "Serving");
         serve::serve(listen, accept, drain.signal()).await

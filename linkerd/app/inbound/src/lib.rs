@@ -22,7 +22,7 @@ use linkerd2_app_core::{
     reconnect, router, serve,
     spans::SpanConverter,
     svc::{self, NewService},
-    transport::{self, io::BoxedIo, tls},
+    transport::{self, io::BoxedIo, listen, tls},
     Error, ProxyMetrics, TraceContextLayer, DST_OVERRIDE_HEADER, L5D_CLIENT_ID, L5D_REMOTE_IP,
     L5D_SERVER_ID,
 };
@@ -49,7 +49,7 @@ impl Config {
     pub async fn build<L, S, P>(
         self,
         listen_addr: std::net::SocketAddr,
-        listen: impl Stream<Item = std::io::Result<transport::listen::Connection>> + Send + 'static,
+        listen: impl Stream<Item = std::io::Result<listen::Connection>> + Send + 'static,
         local_identity: tls::Conditional<identity::Local>,
         http_loopback: L,
         profiles_client: P,
@@ -292,7 +292,7 @@ impl Config {
     pub async fn build_server<C, H, S>(
         self,
         listen_addr: std::net::SocketAddr,
-        listen: impl Stream<Item = std::io::Result<transport::listen::Connection>> + Send + 'static,
+        listen: impl Stream<Item = std::io::Result<listen::Connection>> + Send + 'static,
         prevent_loop: impl Into<PreventLoop>,
         tcp_connect: C,
         http_router: H,
@@ -318,7 +318,7 @@ impl Config {
     {
         let ProxyConfig {
             server: ServerConfig { h2_settings, .. },
-            disable_protocol_detection_for_ports,
+            disable_protocol_detection_for_ports: skip_detect,
             dispatch_timeout,
             max_in_flight_requests,
             detect_protocol_timeout,
@@ -393,30 +393,29 @@ impl Config {
         // tasks from their constructor. This helps to ensure that tasks are
         // spawned on the same runtime as the proxy.
         // Forwards TCP streams that cannot be decoded as HTTP.
-        let tcp_forward = svc::stack(tcp_connect.clone())
-            .push(admit::AdmitLayer::new(prevent_loop.into()))
-            .push(svc::layer::mk(tcp::Forward::new));
+        let tcp_forward = svc::stack(tcp::Forward::new(tcp_connect))
+            .push(admit::AdmitLayer::new(prevent_loop.into()));
 
-        let detect_forward = svc::stack(tcp_forward.clone())
+        let http_fwd = tcp_forward
+            .clone()
             .push_map_target(TcpEndpoint::from)
             .into_inner();
         let http = DetectHttp::new(
             h2_settings,
             detect_protocol_timeout,
             http_server,
-            detect_forward,
+            http_fwd,
             drain.clone(),
         );
+
         let tls = svc::stack(http)
             .push(metrics.transport.layer_accept(TransportLabels))
             .push(svc::layer::mk(|inner| {
                 tls::DetectTls::new(local_identity.clone(), inner)
             }));
 
-        let accept_forward = svc::stack(tcp_forward)
-            .push_map_target(TcpEndpoint::from)
-            .into_inner();
-        let accept = SkipDetect::new(disable_protocol_detection_for_ports, tls, accept_forward);
+        let accept_fwd = tcp_forward.push_map_target(TcpEndpoint::from).into_inner();
+        let accept = SkipDetect::new(skip_detect, tls, accept_fwd);
 
         info!(addr = %listen_addr, "Serving");
         serve::serve(listen, accept, drain.signal()).await
